@@ -181,6 +181,17 @@ class NetDevice(object):
         self.model = None
         self.serialNumber = None
 
+        # Network Info
+        self.connectProtocol = None # e.g. 'ssh'
+        self.connectPort = None # e.g. 22
+        self.connectScheme = None # e.g. 'https'
+        self.authMethod = 'tacacs' # e.g. 'tacacs' or 'non-tacacs'
+        self.loginPW = None # vty password
+        self.enablePW = None # enable password
+        self.layer2 = True
+        self.layer3 = True
+        self.layer4 = True
+
         # Administrivia
         self.adminStatus = None
         self.assetID = None
@@ -188,6 +199,7 @@ class NetDevice(object):
         self.budgetName = None
         self.owningTeam = None
         self.owner = None
+        self.onCallID = None
         self.onCallName = None
         self.operationStatus = None
         self.lastUpdate = None
