@@ -1,0 +1,215 @@
+#!/usr/bin/env python
+# like acl_mass_insert but mass deletes terms (juniper only)
+import tempfile
+import pwd
+import re
+import os
+import termios
+import sys
+import shutil
+import IPy
+import tty
+import getopt
+from trigger.acl import parse, ACL
+from trigger.utils.cli import yesno
+
+from datetime import datetime, date, time, timedelta
+from pytz import UTC, timezone
+from simpleparse.error import ParserSyntaxError
+
+dev   = 0
+debug = 0
+
+
+def display_help():
+    print "Usage is: acl_mass_delete [options] <term name> <term name> ..."
+    print "    -a <str>:  acl to remove from"
+    print "    -f <file>: read in a file of term names to remove"
+    sys.exit(2)
+
+def rcs_lock_file(file):
+    log('info', 'Locking RCS file %s' % file)
+    rv = os.spawnlp(os.P_WAIT, 'co', 'co', '-f', '-l', file)
+    if rv:
+        print >>sys.stderr,"Couldn't RCS check out %s" % file
+        return None 
+    return file
+    
+def log(type, msg):
+    if type == 'debug' and debug == 0:
+        return
+    if type == 'dev' and dev == 0:
+        return
+    ts = datetime.now(tz=UTC)
+    print "%s [%s]: %s" % ( ts.ctime(), type, msg )
+
+def rcs_lock_file_loop(file):
+    import time
+    while not rcs_lock_file(file):
+        log('alert','Sleeping to wait for the lock on the file: %s' % (file))
+        time.sleep(1)
+    return file
+
+def normalize(a):
+    '''Fix up the ACL, and return False if there are problems.'''
+    ok = True
+    # JunOS counter policy and duplicate term names.
+    if a.format == 'junos':
+        for t in a.terms:
+            t.modifiers['count'] = t.name
+        names = set()
+        for t in a.terms:
+            if t.name in names:
+                print 'Duplicate term name', t.name
+                ok = False
+            else:
+                names.add(t.name)
+    # Check for 10/8.
+    for t in a.terms:
+        for addr in ('address', 'source-address', 'destination-address'):
+            for block in t.match.get(addr, []):
+                if block == IP('10/8'):
+                    print 'Matching on 10.0.0.0/8 is never correct'
+                    for line in t.output(a.format):
+                        print '    ' + line
+                    ok = False
+    # Here is the place to put other policy checks; for example, we could
+    # check blue to green HTTP and make sure all those terms have a comment
+    # in a standardized format saying it was approved.
+    return ok
+
+def write_tmpacl(acl):
+    tmpfile = tmpfile = tempfile.mktemp()+'_mass_delete_terms'
+    log('info', 'Writing temporary acl: %s' % tmpfile )
+    f=open(tmpfile,'w')
+    for x in acl.output(acl.format,replace=True):
+        f.write(x)
+        f.write('\n')
+    f.close()
+    return tmpfile
+
+def rcs_unlock_file(file):
+    log('info', 'Unlocking RCS file %s' % file )
+    os.spawnlp(os.P_WAIT, 'co', 'co', '-f', '-u', file)
+    return file
+
+def diff_files(old, new):
+    return os.popen('diff -Naur %s %s' % (old, new)).read()
+
+def worklog(title, diff):
+    """save the diff to a worklog"""
+    from time import strftime,localtime
+    date = strftime('%Y%m%d', localtime())
+    file = "/netsec/firewalls/workdocs/workdoc.%s" % (date)
+    if not os.path.isfile(file):
+        log('alert', 'Creating new worklog %s' % file )
+        f = open(file,"w")
+        f.write("# vi:noai:\n\n")
+        f.close()
+        os.spawnlp(os.P_WAIT,'ci','ci','-m.', '-t-', '-i', file)
+    log('info', 'inserting the diff into the worklog %s' % file)
+    rcs_lock_file_loop(file)
+    fd = open(file,"a")
+    fd.write('"%s"\n' % title)
+    fd.write(diff)
+    fd.close()
+    logstr = "updated by acl_mass_delete"
+    log('info', 'inserting %s into the load queue'%title)
+    os.spawnlp(os.P_WAIT, 'ci', 'ci', '-u', '-m' + logstr, file)
+    os.spawnlp(os.P_WAIT, '/netsec/bin/acl', '/netsec/bin/acl', '-i', title)
+
+
+if __name__ == '__main__':
+    #acl_file = sys.argv[1]
+    #terms_to_remove    = sys.argv[2:]
+    acl_file = None
+    terms_to_remove = [] 
+
+    argcnt = 1
+    opts,args = getopt.getopt(sys.argv[1:], "f:ha:")
+    for o, a in opts:
+        if o == '-f':
+            try:
+                f = open(a, 'r')
+            except:
+                log('error',"Could not open file")
+                sys.exit(1)
+
+            line = f.readline()
+            while line:
+                terms_to_remove.append(line.rstrip())
+                line = f.readline()
+            f.close()
+            argcnt += 2
+        elif o == '-a':
+            acl_file = a
+            argcnt += 2
+        else:
+            display_help()
+
+    for f in sys.argv[argcnt:]:
+        terms_to_remove.append(f)
+
+    rcs_lock_file_loop(acl_file)
+
+    try:
+        old_acl = parse(file(acl_file))
+    except Exception, e:
+        etxt = str(e).split()
+        log('error','Cannot parse %s: %s' % (acl_file , ' '.join(etxt[1:])))
+        sys.exit(2)
+
+    if old_acl.format != 'junos':
+        log('error',"This program can only be run on JUNOS like filters")
+        sys.exit(2)
+
+    new_acl = ACL()
+    new_acl.format   = old_acl.format
+    new_acl.comments = old_acl.comments
+    new_acl.name     = old_acl.name
+
+    for term in old_acl.terms:
+        if term.name in terms_to_remove:
+            log('alert',"REMOVING THE FOLLOWING TERM:")
+            for x in term.output(old_acl.format):
+                print x
+            print "===="
+            if yesno("Do you really want to remove the above term?"):
+                continue
+        new_acl.terms.append(term) 
+
+    if not normalize(new_acl):
+        rcs_unlock_file(acl_file)
+        log('error',"Normalize error")
+        sys.exit(2)
+
+    tmpfile = write_tmpacl(new_acl)
+    diff    = diff_files(acl_file, tmpfile)
+
+    if not diff:
+        log('alert',"No changes made...")
+        rcs_unlock_file(acl_file)
+        os.remove(tmpfile)
+        sys.exit(1)
+
+    print '"%s"' % acl_file
+    print "=== BEGIN CHANGES ===" 
+    print diff
+    print "=== END CHANGES ====="
+    if not yesno("You sure these changes all look correct?"):
+        print "Not making any changes"
+        rcs_unlock_file(acl_file)
+        os.remove(tmpfile)
+        sys.exit(1)
+
+    shutil.copy(tmpfile, acl_file)
+    os.spawnlp(os.P_WAIT, 'ci', 'ci', '-u', '-m' + 'updated from mass_delete_terms', acl_file)
+    os.remove(tmpfile)
+
+    old_file_short = acl_file 
+    r = re.compile('\/(acl\..*?)$')
+    ar = r.findall(acl_file)
+    if ar:
+        old_file_short = ar[0]
+    
+    worklog(old_file_short, diff) 

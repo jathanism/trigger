@@ -1,0 +1,164 @@
+#!/usr/bin/env python
+#import getopt
+from optparse import OptionParser
+import os
+import re
+import shutil
+from simpleparse.error import ParserSyntaxError
+from trigger.acl import parse, ACL
+from trigger.utils.cli import yesno
+import trigger.acl.tools as acl_tools
+import tempfile
+import tty
+import termios
+import sys
+
+debug = 0
+verbose = 0
+
+def generate_new_acl(new_term, old_term):
+    new_acl = ACL() 
+    permitted = None
+    for c in old_term.comments:
+        new_acl.comments.append(c)
+        
+    new_acl.policers = old_term.policers
+
+    stop = False 
+    for t in old_term.terms:
+        if not stop:
+            hit = True
+            complicated = False
+            for k,v in t.match.iteritems():
+                if not new_term.match.has_key(k):
+                    complicated = True
+                else:
+                    for test in new_term.match[k]:
+                        if test not in v:
+                            hit = False
+                            break
+                    
+            if hit and not t.inactive:
+                if not complicated and permitted is None:
+                    if t.action[0] == 'accept':
+                        permitted = True
+                    else:
+                        new_acl.terms.append(new_term)
+                        stop = True
+        new_acl.terms.append(t)
+    return new_acl
+    
+def name_terms(acl):
+    n = 1
+    for t in acl.terms:
+        if t.name is None:
+            # random random.randrange(0,65535)
+            import random
+            t.name = 'massT%d_%d' % (n, random.randrange(0,432423432524))
+            n += 1
+
+def parse_args(argv):
+    parser = OptionParser(usage='%prog [options]', description='''\
+ACL Mass Inserter
+
+Will perform a merge of access from a source file to acl files passed as a file glob at the end of the command line.''')
+    parser.add_option('-i', '--insert', type='string', metavar='FILENAME',
+        help='seed FILENAME to insert (must pass this flag for acl_mass_insert to actually work)')
+    parser.add_option('-d', '--debug', action='store_true',
+        help='print debug output for each operation -- this is ugly')
+    parser.add_option('-v', '--verbose', action='store_true',
+        help='print verbose output')
+    #parser.add_option('-q', '--quiet', action='store_true',
+    #    help='suppress all output (such as when called by cron) -- cannot be used alone')
+
+    opts, args = parser.parse_args(argv)
+
+    if not opts.insert:
+        parser.print_help()
+        sys.exit(0)
+
+    return opts, args
+
+def print_help():
+    print "Usage mass_insert -i <acl template> <acl to insert into> <acl to insert into>...."
+    print "\t-d: debug"
+    print "\t-v: verbose"
+    print "Example: mass_insert -i ./new_jumphost /netsec/firewall/acl.115 /netsec/firewall/acl.115j /netsec/firewall/acl.2131*"
+    print "     Where 'new_jumphost' is a file that contains either cisco or juniper type syntax"
+   
+if __name__ == '__main__':
+    acl_out_file = None
+    acl_in_file  = None 
+    filez = []
+    opts, args = parse_args(sys.argv)
+    acl_in_file = opts.insert
+    for x in args[1:]:
+        filez.append(x)
+    try:
+        acl_in = parse(file(acl_in_file))
+    except ParserSyntaxError, e:
+        sys.exit(0)
+    for acl_out_file in filez:
+        new_acl = None
+        try:
+            acl_out = parse(file(acl_out_file))
+        except ParserSyntaxError, e:
+            etxt = str(e).split()
+            print 'Cannot parse %s:' % acl_out_file, ' '.join(etxt[1:])
+            sys.exit(0)
+        count = 0;
+        for in_term in acl_in.terms:
+            if new_acl == None:
+                new_acl = acl_out
+            new_acl = generate_new_acl(in_term, new_acl)
+        new_acl.name = acl_out.name
+        print "Locking output acl.."
+        rv = os.spawnlp(os.P_WAIT, 'co', 'co', '-f', '-l', acl_out_file)
+        if rv:
+            print >>sys.stderr, "couldn't check out " + acl_out_file 
+            sys.exit(1)
+        print "Writing tmp acl.."
+        tmpfile = tempfile.mktemp()
+        f = open(tmpfile,'w')
+        print tmpfile
+        if acl_out.format == 'junos' and acl_in.format != 'junos':
+            name_terms(acl_in)
+        for x in new_acl.output(acl_out.format,replace=True):
+            f.write(x)
+            f.write('\n')
+        f.close()
+        diff = os.popen('diff -Naur %s %s' % (acl_out_file, tmpfile)).read()
+        if not diff:
+            print "No changes need to be made"
+            os.spawnlp(os.P_WAIT, 'co', 'co', '-f', '-u', acl_out_file)
+            os.remove(tmpfile)
+            continue
+        print "HERE IS WHAT IS ABOUT TO BE DONE IN patch form======================"
+        print diff
+        print "===================================================================="
+        print ''
+        print ''
+        if not yesno('Do you want to save changes?'):
+            print "Not making the changes."
+            os.spawnlp(os.P_WAIT, 'co', 'co', '-f', '-u', acl_out_file)
+            os.remove(tmpfile)
+            continue
+        shutil.copy(tmpfile, acl_out_file)
+        log = 'from mass_insert\n'
+        pats = (re.compile(r'^\+.*!+(.*)'), re.compile(r'^\+.*/\*(.*)\*/'))
+        for line in diff.split('\n'):
+            for pat in pats:
+                m = pat.match(line)
+                if m:
+                    msg = m.group(1).strip()
+                    if msg:
+                        log += m.group(1).strip() + '\n'
+                    break
+        if log:
+            print 'Autodetected log message:'
+            print log
+            print ''
+        os.spawnlp(os.P_WAIT, 'ci', 'ci', '-u', '-m' + log, acl_out_file)
+        os.remove(tmpfile)
+
+        acl_tools.worklog(acl_out_file, diff)  #do_workdoc(acl_out_file, diff)
