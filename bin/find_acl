@@ -1,0 +1,1204 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+find_acl - Determine all access-lists in a path, bi-directionally.
+
+How this works:
+
++ Start at a randomly selected route-reflector (any router would do).
++ Log into each router to collect information, and recurse towards the next hops
+  forward and backward.  
++ Stop when we reach the target IP, or a device of a type we don't know about.
++ We now have a directed tree of all devices between the source and destination
+  (and possibly some other spurious ones like the initial router).
++ From the source address, walk toward the destination.
++ At each hop, check the outbound ACL on the interface.
++ Then, recurse towards the next device, checking the inbound ACL on that
+  interface, identifying the inbound interface by matching subnet IP addresses
+  with the outbound interface of the previous hop.
+
+This automatically prunes away the starting routers if they are not on
+the path, handles tunnels, etc. Also note that it doesn't matter if we
+take an asymmetric path back to the source, as long as we get there,
+since we will walk back the real path to the dest.
+
+This will not work when packets are policy routed based on source.
+
+In theory there are many possible paths because each tier of routers is
+bowtied to the one below.  However, we collect only the single best route
+towards the next/previous hop.  This avoids a combinatorial explosion
+of 2**n hops, which is more theoretically correct but is less useful as
+find_acl output when humans want to know what path will be taken.
+"""
+
+__author__ = 'Jathan McCollum, Eileen Tschetter, Mark Ellzey Thomas, Michael Shields'
+__maintainer__ = 'Jathan McCollum'
+__email__ = 'jathan.mccollum@teamaol.com'
+__copyright__ = 'Copyright 2003-2013, AOL Inc.'
+__version__ = '2.3.3'
+
+import codecs
+from collections import namedtuple
+from IPy import IP
+import os
+import random
+import re
+import socket
+import sys
+from twisted.internet import reactor, defer, protocol
+from twisted.python import log
+from xml.etree.cElementTree import ElementTree, Element, SubElement, dump
+
+from trigger.cmds import NetACLInfo
+from trigger.conf import settings
+from trigger.netdevices import NetDevices
+from trigger.twister import execute_netscreen, execute_junoscript, execute_ioslike
+
+
+# Default globals
+source_ip = None
+dest_ip   = None
+pass_cache = {}
+
+# Debug?
+DEBUG = os.getenv('DEBUG')
+DEBUG_DNS = os.getenv('DEBUG_DNS')
+
+# Default timeout for device interaction
+TIMEOUT = 300
+
+# Exceptions
+class PathLoopError(StandardError):
+    pass
+
+# Namedtuples
+NextHop = namedtuple('NextHop', 'address interface') 
+
+# Functions
+def parse_arg(arg):
+    '''Accept any of: '192.0.2.3', 'some.host.name', '192.0.2.0/24'
+    (equivalent to '192.0.2.1').  Also allow trailing commas for your
+    cut-and-paste convenience.'''
+    if arg.endswith(','):
+        arg = arg[:-1]
+
+    if arg == 'any':
+        return IP('0.0.0.0')
+
+    try:
+        net = IP(socket.gethostbyname(arg))
+    except socket.gaierror:
+        net = IP(arg)
+
+    if net.prefixlen() < 32:
+        return IP(net.int() + 1)
+    return net
+
+def parse_args(argv):
+    '''Return (source, dest, extra); extra args are saved for check_access.'''
+    if len(argv) < 2:
+        print >>sys.stderr, 'usage: %s [source] dest [protocol [port]]' % argv[0]
+        sys.exit(2)
+    elif len(argv) == 2:
+        return IP('0.0.0.0'), parse_arg(argv[1]), []
+    elif argv[2].isdigit():
+        return IP('0.0.0.0'), parse_arg(argv[1]), argv[2:]
+    else:
+        return parse_arg(argv[1]), parse_arg(argv[2]), argv[3:]
+
+def get_password(device):
+    if device not in pass_cache:
+        if hasattr(sys, 'ps1') or not sys.stderr.isatty() \
+         or not sys.stdin.isatty() or not sys.stdout.isatty():
+            # shell not in interactive mode.
+            print "NON INTERACTIVE SHELL!"
+            pass
+        else:
+            if device.deviceType == 'FIREWALL':
+                import getpass
+                username = getpass._raw_input('\nUsername for %s: ' % device)
+                password = getpass.getpass('Password for %s: ' % device)
+                print ''
+                creds = (username, password)
+                pass_cache[device] = creds
+    return pass_cache[device]
+
+def dev_for_ip(ip):
+    '''Try to heuristically map an IP address to a NetDevice object.
+    Return None if unable.'''
+    if ip is None:
+        return
+
+    nd = NetDevices()
+    try:
+        hostname = socket.gethostbyaddr(str(ip))[0]
+    except (socket.herror, socket.gaierror):
+        print "WARNING: %s does not have a reverse DNS entry." % ip
+        return None
+
+    # Try to map xar1-abc-S1-0-0.foo.net to xar1-abc.foo.net.
+    host = hostname
+    while True:
+        if host in nd:
+            return nd[host]
+        host, subs = re.subn(r'^([^.]+)-[^-.]+(\..*)$', r'\1\2', host, 1)
+        if not subs:
+            break
+
+    # Ok, that didn't work.  Now try without the domain names, since
+    # they are often inconsistent (router.foo.com vs. net.foo.com vs.
+    # foo.net vs. abc.net).
+    parts = hostname.split('.')[0].split('-')
+    while parts:
+        try:
+            dev = nd.find('-'.join(parts))
+            return dev
+        except KeyError:
+            parts.pop()
+
+    print "WARNING: Could not find any correct information for  %s (%s)" % (ip,hostname)
+    return None
+
+def IPsubnet(addr):
+    '''Given '172.20.1.4/24', return IP('172.20.1.0/24').'''
+    net, mask = addr.split('/')
+    netbase = (IP(net).int() &
+               (0xffffffffL ^ (2**(32-int(mask))-1)))
+    return IP('%d/%s' % (netbase, mask))
+
+def children_with_namespace(ns):
+    '''XML helper.'''
+    return lambda elt, tag: elt.findall('./' + ns + tag)
+
+def parse_netscreen_hop(x):
+    ''' simply returns a route id '''
+    pat = re.compile('\(id\=(\d+)\)')
+    m = pat.findall(x)
+    if m:
+        return int(m[0])
+    return -1
+
+def parse_netscreen_hopid(text):
+    '''
+id:                   5
+IP address/mask:      172.21.88.14/29
+next hop (gateway):   0.0.0.0
+preference:           0
+metric:               0
+outgoing interface:   ethernet5/0.1
+vsys name/id:         Root/0
+tag:                  0
+flag:                 24000200/00100000
+type:                 connected
+Redistributed to:
+status:               active (for 1 days 11 hours 1 minutes 59 seconds)
+    '''
+
+    words = text.split('\r\n')
+    p = re.compile('(.*?):\s+(.*)$')
+    next_hop = None
+    interface = None
+    connected = False
+    for line in words:
+        match = p.findall(line)
+        if match:
+            key, val = match[0]
+            #key = m[0][0]
+            #val  =m[0][1]
+            if key == 'next hop (gateway)':
+                next_hop = val
+            elif key == 'outgoing interface':
+                interface = val
+            elif key == 'type':
+                if val == 'connected':
+                    connected = True
+
+    if connected:
+        #return None, interface
+        return NextHop(None, interface)
+
+    #return next_hop, interface
+    return NextHop(next_hop, interface)
+
+def parse_cisco_hop(text):
+    '''This makes lots of assumptions about Cisco's format.  It will
+    throw exceptions if they are inaccurate.  Then we can fix the code.
+
+    Typical lines are:
+    "  * 172.31.4.186, from 10.8.0.251, 5d20h ago, via GigabitEthernet3/1"
+    "  * directly connected, via FastEthernet1/0"'''
+
+    if ('% Network not in table\n' in str(text)
+         or '% Subnet not in table\n' in str(text)):
+        # "Subnet not in table" means there is another network in the
+        # same *classful block* as the one you asked about.  Cisco,
+        # what year is it?
+        return None, None
+
+    if 'last resort' in str(text):
+        # This is for routers that don't use 0.0.0.0 (sigh)
+        words = text.split(' ')
+        return words[5], None
+
+    stars = [line for line in text.split('\n') if line.startswith('  * ')]
+    if not stars:
+        return NextHop(None, None)
+
+    active = stars[0].split(', ')
+    interface = dict([x.split(' ', 1) for x in active[1:]]).get('via', None)
+
+    if active[0] == '  * directly connected':
+        #return None, interface
+        return NextHop(None, interface)
+
+    #return IP(active[0][4:]), interface
+    return NextHop(IP(active[0][4:]), interface)
+
+def parse_brocade_hop(text):
+    """
+    Parse Brocade-style hop (which of course differs just enough from Foundry)
+    and return 2-tuple of (interface_ip, interface_name).
+
+    Typical lines are:
+
+    Type Codes - B:BGP D:Connected I:ISIS O:OSPF R:RIP S:Static; Cost - Dist/Metric
+    BGP  Codes - i:iBGP e:eBGP
+    ISIS Codes - L1:Level-1 L2:Level-2
+    OSPF Codes - i:Inter Area 1:External Type 1 2:External Type 2 s:Sham Link
+            Destination        Gateway         Port        Cost          Type Uptime
+    1       0.0.0.0/0          66.185.150.33   eth 1/1     20/0          Be   4d0h  
+    """
+
+    lines = text.split('\n')
+    for line in lines:
+        if any([not line, 
+                not line[1].isspace(),
+                'Destination' in line,
+                'Codes' in line,
+               ]):
+            continue
+
+        parts = line.split()
+        if len(parts) == 8:
+            # => ['1', '0.0.0.0/0', '66.185.150.33', 'eth', '1/1', '20/0', 'Be', '4d0h']
+            # ['1',     
+            #           '0.0.0.0/0', 
+            #                 '66.185.150.33', 
+            #                          'eth', 
+            #                                      '1/1', 
+            #                                                  '20/0', 
+            #                                                        'Be', 
+            #                                                                    '4d0h']
+            is_gateway, dest, gateway, iface_type, iface_port, cost, route_type, uptime = parts
+            port = '%s %s' % (iface_type, iface_port)
+        else:
+            raise ValueError("couldn't parse line: '%s'" % line)
+
+        # Codes used by Brocade route display:
+        #
+        # Type Codes - B:BGP D:Connected I:ISIS O:OSPF R:RIP S:Static; Cost - # Dist/Metric
+        # BGP  Codes - i:iBGP e:eBGP
+        # ISIS Codes - L1:Level-1 L2:Level-2
+        # OSPF Codes - i:Inter Area 1:External Type 1 2:External Type 2 s:Sham Link
+
+        # Returns something like NextHop(IP('66.185.150.33'), 'eth 1/1')
+        if route_type == 'D':
+            #return None, port
+            return NextHop(None, port)
+        # These are redundant but explicit...
+        if route_type == 'S':
+            #return IP(gateway), port
+            return NextHop(IP(gateway), port)
+        if route_type.startswith(('B', 'O')):
+            #return IP(gateway), port
+            return NextHop(IP(gateway), port)
+        if is_gateway == '1': # 
+            #return IP(gateway), port
+            return NextHop(IP(gateway), port)
+
+    #return None, None
+    return NextHop(None, None)
+
+def parse_foundry_hop(text):
+    '''Typical lines are:
+    "        Destination        Gateway         Port       Cost   Type"
+    "        64.12.84.0/27      DIRECT          4/5        1      D"
+    "        0.0.0.0/0         *172.20.148.89   4/7        1      O"
+    "        0.0.0.0/0          172.20.149.89   4/8        1      O"
+    "        Destination     NetMask         Gateway         Port       Cost   Type"
+    "        205.188.224.0   255.255.255.0   0.0.0.0         v1         1      D"
+    "        207.200.69.32   255.255.255.224*172.17.66.1     25         5      O"
+    "      10.147.0.0/16     *172.20.2.233    7/8               B   "'''
+
+    def port_to_interface(port):
+        if port.startswith('lb'):
+            return 'loopback ' + port[2:]
+        elif port.startswith('v'):
+            return 've ' + port[1:]
+        else:
+            return 'ethernet ' + port
+
+    for line in text.split('\n'):
+        if not line or not line[0].isspace() or 'Destination' in line:
+            continue
+
+        if len(line) == 78:
+            # Separate "Destination" and "NetMask" [sic] fields, instead
+            # of CIDR notation.  Maybe with colliding fields, so we can't
+            # even use split().
+            dest = line[8:24].rstrip() + '/' + line[24:39].rstrip()
+            gateway = line[39:55].strip()
+            port = line[56:67].rstrip()
+            route_type = line[74:75]
+        else:
+            a = line.split()
+            if len(a) == 5:
+                dest, gateway, port, cost, route_type = a
+            elif len(a) == 4:
+                dest, gateway, port, route_type = a
+            else:
+                raise ValueError("couldn't parse line: '%s'" % line)
+
+        if gateway.startswith('*'):
+            #return IP(gateway[1:]), port_to_interface(port)
+            return NextHop(IP(gateway[1:]), port_to_interface(port))
+        if route_type == 'S':  # S means static, which apparently doesn't get a *
+            #return IP(gateway), port_to_interface(port)
+            return NextHop(IP(gateway), port_to_interface(port))
+        if route_type == 'D':  # D means direct
+            #return None, port_to_interface(port)
+            return NextHop(None, port_to_interface(port))
+        if route_type in ['O','B']:  # O means ospf! OMG B means BGP!
+            #return IP(gateway), port_to_interface(port)
+            return NextHop(IP(gateway), port_to_interface(port))
+
+    #return None, None
+    return NextHop(None, None)
+
+def parse_juniper_hop(xml):
+    '''Returns (next_hop, interface).'''
+
+    # Find the namespace of the week.  Juniper decided to use a different
+    # XML namespace for every version!
+    pat = re.compile(r'^({http://xml\.juniper\.net/junos/[^/]+/junos-routing})'
+                     r'route-information$')
+    m = pat.match(xml[0].tag)
+    assert m
+    ns = m.group(1)
+
+    # This code could be simpler with full XPath support, but ElementTree
+    # doesn't keep parent links and so doesn't support ".." expressions.
+    children = children_with_namespace(ns)
+    for rt_entry in xml.getiterator(ns + 'rt-entry'):
+        if not children(rt_entry, 'current-active'):
+            continue
+        for nh in children(rt_entry, 'nh'):
+            if children(nh, 'selected-next-hop') is None:
+                continue
+            next_hop, interface = None, None
+            to = children(nh, 'to')
+            if to:
+                next_hop = to[0].text
+            else:
+                learned_from = children(rt_entry, 'learned-from')
+                if learned_from:
+                    next_hop = learned_from[0].text
+            via = children(nh, 'via')
+            if via:
+                interface = via[0].text
+            #return next_hop, interface
+            return NextHop(next_hop, interface)
+
+    #return None, None
+    return NextHop(None, None)
+
+def parse_netscreen_config(text):
+    '''
+set interface "ethernet0/0" zone "Null"
+set interface "ethernet0/1" zone "Null"
+set interface "ethernet0/2" zone "HA"
+set interface "ethernet2/0" zone "Untrust"
+set interface "ethernet3/0" zone "Untrust"
+set interface "ethernet5/0" zone "Test-Blue"
+set interface "ethernet5/0.1" tag 5 zone "Trust"
+set interface "ethernet6/0" zone "Test-Blue"
+set interface "ethernet0/0.4" tag 2003 zone "TimeSTI"
+set interface ethernet0/0.4:1 ip 64.236.114.22/29
+set interface ethernet2/0 ip 172.21.44.42/30
+set interface ethernet3/0 ip 172.21.44.34/30
+set interface ethernet5/0 ip 172.21.88.50/30
+set interface ethernet5/0.1 ip 172.21.88.14/29
+set interface ethernet6/0 ip 172.21.88.42/30
+set interface ethernet2/0 ip manageable
+set interface ethernet3/0 ip manageable
+set interface ethernet5/0 ip manageable
+set interface ethernet5/0.1 ip manageable
+set interface ethernet6/0 ip manageable
+
+    '''
+    data = {'in_acls': {}, 'out_acls': {}, 'subnets': {}, 'addrs': {}}
+    interface = None
+    pat = re.compile('set\s+interface\s+(\S+).*(ip|zone)\s+(\d+\.\d+\.\d+\.\d+\/\d+|\"(\S+)\")')
+    for line in text.split('\n'):
+        line = line.rstrip()
+        m = pat.findall(line)
+        if m:
+            interface = m[0][0]
+            zone_ip   = m[0][1]
+            address   = m[0][2]
+            zone      = m[0][3]
+            if zone_ip == 'zone':
+                if '"' in interface:
+                    interface = interface[1:len(interface)-1]
+                #data['in_acls'][interface] = data['out_acls'][interface] = "Netscreen:%s" % zone
+                data['in_acls'][interface] = data['out_acls'][interface] = ["Netscreen:%s" % zone]
+
+            else:
+                data['subnets'][interface] = []
+                data['addrs'][interface] = []
+                data['addrs'][interface].append(IP(address[:address.index('/')]))
+                data['subnets'][interface].append(IPsubnet(address))
+
+    return data
+
+def parse_ioslike_config(text):
+    data = {'in_acls': {}, 'out_acls': {}, 'subnets': {}, 'addrs': {}}
+    interface = None
+    for line in text.split('\n'):
+        line = line.rstrip()    # yes, really
+
+        if line.startswith('interface '):
+            words = line.split(' ')
+            if len(words) == 2:
+                interface = words[1]
+            elif words[2][0].isdigit():
+                # Foundry interface like "ethernet 4".
+                interface = ' '.join(words[1:3])
+            else:
+                # Cisco subinterface like "Serial0/3.111 point-to-point".
+                interface = words[1]
+            #data['in_acls'][interface] = data['out_acls'][interface] = None
+            data['in_acls'][interface] = data['out_acls'][interface] = []
+            data['subnets'][interface] = []
+            data['addrs'][interface] = []
+
+        if line == '!':
+            interface = None
+
+        if line.startswith(' ip address '):
+            assert interface
+            if '/' in line:
+                cidr = line.split(' ')[3]
+                data['subnets'][interface].append(IPsubnet(cidr))
+                data['addrs'][interface].append(IP(cidr[:cidr.index('/')]))
+            else:
+                addr, mask = [IP(x).int() for x in line.split(' ')[3:5]]
+                data['subnets'][interface].append(IP('%d/%s' %
+                                                     (addr & mask, IP(mask))))
+                data['addrs'][interface].append(IP(addr))
+        if line.startswith(' ip access-group '):
+            assert interface
+            acl, direction = line.split(' ')[3:]
+            assert direction in ('in', 'out')
+            #data['%s_acls' % direction][interface] = acl
+            data['%s_acls' % direction][interface] = [acl]
+
+    return data
+
+def parse_juniper_config(xml):
+    '''Returns dictionary {'so-1/2/3.0': ('in_acls', 'out_acls')}'''
+
+    ns = '{http://xml.juniper.net/xnm/1.1/xnm}'
+    children = children_with_namespace(ns)
+
+    data = {'in_acls': {}, 'out_acls': {}, 'subnets': {}, 'addrs': {}}
+
+    for interface in xml.getiterator(ns + 'interface'):
+
+        basename = children(interface, 'name')[0].text
+        description = children(interface, 'description')
+        desctext = []
+
+        if description:
+            [desctext.append(i.text) for i in description]
+
+        for unit in children(interface, 'unit'):
+            ifname = basename + '.' + children(unit, 'name')[0].text
+
+            # Iterating the "family/inet" tree. Seems ugly.
+            for family in children(unit, 'family'):
+                for family2 in family:
+                    if family2.tag != ns + 'inet':
+                        continue
+                    for inout in 'in', 'out':
+                        data['%s_acls' % inout][ifname] = []
+
+                        # Try basic 'filter/xput'...
+                        acl = family2.find('%sfilter/%s%sput' % (ns, ns, inout))
+
+                        # Junos 9.x changes to 'filter/xput/filter-name'
+                        if acl and "    " in  acl.text:
+                            acl = family2.find('%sfilter/%s%sput/%sfilter-name' % (ns, ns, inout, ns))
+
+                        # Pushes text as variable name.  Must be a better way to do this?
+                        if acl is not None:
+                            acl = acl.text
+
+                        # If we couldn't match a single acl, try 'filter/xput-list'
+                        if not acl:
+                            #print 'trying filter list..'
+                            acl = [i.text for i in family2.findall('%sfilter/%s%sput-list' % (ns, ns, inout))]
+                            #if acl: print 'got filter list'
+
+                        # Otherwise, making single acl into a list
+                        else:
+                            acl = [acl]
+
+                        # Append acl list to dict
+                        #data['%s_acls' % inout][ifname] = acl
+                        if acl:
+                            data['%s_acls' % inout][ifname].extend(acl)
+
+                    data['subnets'][ifname] = []
+                    data['addrs'][ifname] = []
+                    for node in family2.findall('%saddress/%sname' % (ns, ns)):
+                        ip = node.text
+                        data['subnets'][ifname].append(IPsubnet(ip))
+                        data['addrs'][ifname].append(IP(ip[:ip.index('/')]))
+
+    return data
+
+def set_zones_for_subinterfaces(data):
+    # sometimes we get in a situation where we have
+    # sub-interfaces. These can't match a zone so they
+    # don't register as having an "ACL". This takes all the
+    # interfaces with sub interfaces and finds the zones for them
+    for iface in data['addrs']:
+        if ":" in iface:
+            if DEBUG:
+                print "set_zones_for_subinterfaces():", iface
+            # find him in out and in acls
+            sint = iface.split(':')[0]
+            zone_in =  data['out_acls'][sint]
+            zone_out = data['in_acls'][sint]
+            data['out_acls'][iface] = [zone_out]
+            data['in_acls'][iface] = [zone_in]
+
+def collect_netscreen(dev, source, dest, spin):
+    def return_data(x):
+        return x
+    data = {}
+    results = []
+    def gen():
+        yield 'set cons page 0'
+        yield 'get route ip 0.0.0.0'
+        route_id = parse_netscreen_hop(results[-1])
+        if route_id:
+            yield 'get route id %d' % route_id
+            default_hop, default_interface = parse_netscreen_hopid(results[-1])
+        for prevnext,target in (('prev', source), ('next', dest)):
+            log.msg("%s - %s for %s" % (str(prevnext), str(target), str(dev)), DEBUG=True)
+            route_id = -1
+            yield 'get route ip %s' % target
+            route_id = parse_netscreen_hop(results[-1])
+            yield 'get route id %d' % route_id
+            hop,interface = parse_netscreen_hopid(results[-1])
+            if not hop and not interface:
+                hop, interface = default_hop, default_interface
+            elif hop and not interface:
+                yield 'get route ip %s' % hop
+                route_id = parse_netscreen_hop(results[-1])
+                yield 'get route id %d' % route_id
+                interface = parse_netscreen_hopid(results[-1])[1]
+            data[prevnext + '_hop'] = hop
+            data[prevnext + '_interface'] = interface
+        yield 'get conf | inc "^set interface.*(ip|zone)"'
+        data.update(parse_netscreen_config(results[-1]))
+
+    def update_results(r):
+        results[:] = r
+        if not DEBUG: spin(dev)
+
+    def return_data(arg):
+        set_zones_for_subinterfaces(data)
+        return data
+
+    deferred = execute_netscreen(dev, gen(), incremental=update_results, 
+                                     timeout=TIMEOUT)
+    deferred.addCallback(return_data)
+
+    return deferred
+
+def collect_cisco(dev, source, dest, spin):
+    data = {}
+    results = []
+    def gen():
+        # Check the default route, since (at least in 12.2(18)SXD6),
+        # 'show ip route' can return '% Network not in table' even when
+        # there is a default.  Foundry actually gets this right.
+        yield 'show ip route 0.0.0.0'
+        default_hop, default_interface = parse_cisco_hop(results[-1])
+
+        if not default_hop and not default_interface:
+            yield 'show ip route | inc last resort'
+            default_hop, default_interface = parse_cisco_hop(results[-1])
+            # we don't get the interface on the first pass.
+            yield 'show ip route %s' % default_hop
+            default_interface = parse_cisco_hop(results[-1])[1]
+        for prevnext, target in (('prev', source), ('next', dest)):
+            log.msg("%s - %s for %s" % (str(prevnext), str(target), str(dev)), DEBUG=True)
+            yield 'show ip route %s' % target
+            hop, interface = parse_cisco_hop(results[-1])
+            if not hop and not interface:
+                hop, interface = default_hop, default_interface
+            elif hop and not interface:
+                # Cisco only lists a next interface for connected routes.
+                yield 'show ip route %s' % hop
+                interface = parse_cisco_hop(results[-1])[1]
+            elif interface == 'Null0':
+                hop, interface = None, None
+            data[prevnext + '_hop'] = hop
+            data[prevnext + '_interface'] = interface
+        yield ('show configuration | include '
+               r'^(interface | ip address | ip access-group |!)')
+        data.update(parse_ioslike_config(results[-1]))
+
+    def update_results(r):
+        log.msg('Got %s from %s' % (str(r), str(dev)), DEBUG=True)
+        results[:] = r
+        if not DEBUG: spin(dev)
+
+    def return_data(arg):
+        return data
+
+    deferred = execute_ioslike(dev, gen(), incremental=update_results, 
+                               with_errors=True, timeout=TIMEOUT)
+    deferred.addCallback(return_data)
+
+    return deferred
+
+def collect_brocade(dev, source, dest, spin):
+    if DEBUG:
+        print 'COLLECTING', dev
+        print '\tsrc:', source
+        print '\tdst:', dest
+
+    commands = ['show ip route %s' % source,
+                'show ip route %s' % dest,
+                'show configuration']
+    def inc(r):
+        if not DEBUG: spin(dev)
+
+    deferred = execute_ioslike(dev, commands, incremental=inc, 
+                               with_errors=True, timeout=TIMEOUT)
+    def cb(x):
+        data = {}
+        data['prev_hop'], data['prev_interface'] = parse_brocade_hop(x[0])
+        data['next_hop'], data['next_interface'] = parse_brocade_hop(x[1])
+        data.update(parse_ioslike_config(x[2]))
+        return data
+
+    deferred.addCallback(cb)
+
+    return deferred
+
+def collect_foundry(dev, source, dest, spin):
+    if DEBUG:
+        print 'COLLECTING', dev
+        print '\tsrc:', source
+        print '\tdst:', dest
+
+    commands = ['show ip route %s' % source,
+                'show ip route %s' % dest,
+                'show configuration']
+    def inc(r):
+        if not DEBUG: spin(dev)
+    deferred = execute_ioslike(dev, commands, incremental=inc, 
+                               with_errors=True, timeout=TIMEOUT)
+    def cb(x):
+        data = {}
+        data['prev_hop'], data['prev_interface'] = parse_foundry_hop(x[0])
+        data['next_hop'], data['next_interface'] = parse_foundry_hop(x[1])
+        data.update(parse_ioslike_config(x[2]))
+        return data
+    deferred.addCallback(cb)
+
+    return deferred
+
+def collect_juniper(dev, source, dest, spin):
+    commands = []
+    if DEBUG:
+        print 'COLLECTING', dev
+        print '\tsrc:', source
+        print '\tdst:', dest
+
+    for target in source, dest:
+        elt = Element('get-route-information')
+        destelt = SubElement(elt, 'destination')
+        destelt.text = str(target)
+        commands.append(elt)
+    elt = Element('get-configuration', database='committed', inherit='inherit')
+    SubElement(SubElement(elt, 'configuration'), 'interfaces')
+    commands.append(elt)
+    def inc(r):
+        if not DEBUG: spin(dev)
+    deferred = execute_junoscript(dev, commands, incremental=inc, with_errors=True, timeout=TIMEOUT)
+    def cb(x):
+        """
+        Callback for collect_juniper, debug stuff:
+
+        print '^-^-' * 10
+        print 'prev_interface'
+        print dump(x[0])
+        print '-' * 10
+        print 'next_interface'
+        print dump(x[1])
+        print '-' * 10
+        print 'config:'
+        print x[2]
+        print '^-^-' * 10
+        import time
+        time.sleep(60)
+        """
+        data = {}
+        data['prev_hop'], data['prev_interface'] = parse_juniper_hop(x[0])
+        data['next_hop'], data['next_interface'] = parse_juniper_hop(x[1])
+        data.update(parse_juniper_config(x[2]))
+        return data
+    deferred.addCallback(cb)
+
+    return deferred
+
+def infer_30s_and_31s(data):
+    '''When we have a static route to a point-to-point interface, we can
+    find the other router's IP address and therefore figure out what
+    router it is.'''
+
+    if not data:
+        return
+    for prevnext in ('prev', 'next'):
+        interface = data[prevnext + '_interface']
+        if interface and not data[prevnext + '_hop']:
+            addr = data['addrs'][interface][0]
+            subnet = data['subnets'][interface][0]
+            assert addr in subnet
+            if subnet.prefixlen() == 31:
+                data[prevnext + '_hop'] = IP(addr.int() ^ 1)
+            elif subnet.prefixlen() == 30:
+                data[prevnext + '_hop'] = IP(addr.int() ^ 3)
+
+def collect(dev, source, dest, master_data, master_deferred, spin, _count=[0]):
+    '''Recursively collect data about the given device and the devices
+    it is connected to.  Stop the reactor when done.'''
+
+    if dev is None or dev in master_data:
+        return
+
+    try:
+        collector_map = {
+            'cisco': collect_cisco,
+            'foundry': collect_foundry,
+            'juniper': collect_juniper, 
+            'brocade': collect_brocade
+        }
+        collector_func = collector_map[dev.vendor]
+    except KeyError:
+        # We're off the end of the known world.
+        master_data[dev] = {}
+        return
+
+    # Hack for NetScreens
+    if dev.vendor == 'juniper' and dev.deviceType == 'FIREWALL':
+        collector_func = collect_netscreen
+
+    if not DEBUG: spin(dev)
+
+    _count[0] += 1
+    log.msg("Current count: %s" % _count)
+    master_data[dev] = None
+
+    # Setup deferred for the collector
+    log.msg("Setting up deferred for %s" % dev)
+    deferred = collector_func(dev, source, dest, spin)
+
+    def cb(data):
+        if not DEBUG: spin(dev)
+        if not data:
+            return
+        infer_30s_and_31s(data)
+        master_data[dev] = data
+        for hop in data['prev_hop'], data['next_hop']:
+            dip = dev_for_ip(hop)
+            collect(dip, source, dest,
+                    master_data, master_deferred, spin, _count)
+    deferred.addCallback(cb)
+
+    def decrement(x, _count=_count):
+        _count[0] -= 1
+        if not _count[0]:
+            if not DEBUG: spin(None)
+            master_deferred.callback(master_data)
+        return x
+    deferred.addBoth(decrement)
+
+def do_collect(dev, source, dest, master_data):
+    '''Return a callback that will eventually get a dictionary.  Keys are
+    NetDevice objects.  The value is 'None' if a connection is pending
+    but there are no results yet.  It will be {} if the device is known
+    in NetDevices, but we could not collect information from it (e.g.
+    because it is an unknown make).
+
+    Here are the keys.  Note that this prev/next string assembly thing
+    is Perlish thinking and was a mistake.  Instead it should be a
+    tuple of (IP, 'hop') and (IP, 'interface').
+
+        'prev_hop' -> IP('1.2.3.4') or None
+        'prev_interface' -> 'so-7/0/0.0' or None
+        'next_hop' -> IP('1.2.3.4') or None
+        'next_interface' -> 'so-7/0/0.0' or None
+        'in_acls' -> {'so-1/2/3.0': ['acl']}  or []
+        'out_acls' -> {'so-1/2/3.0': ['acl']}  or []
+        'addrs' -> {'so-1/2/3.0': [IP('172.16.1.2')]}
+        'subnets' -> {'so-1/2/3.0': [IP('172.16.1.0/30')]}'''
+
+    if sys.stdout.isatty():
+        spinner = ['-', '\\', '|', '/']
+        def spin(dev):
+            if dev:
+                c = spinner.pop(0)
+                spinner.append(c)
+            else:
+                c = ''
+            sys.stdout.write('\010' + c)
+            sys.stdout.flush()
+        # Dumb OS X 10.4 Terminal.app lets ^H at the start of a line
+        # (not just when at column 0, but after a newline) go to the
+        # previous line.
+        sys.stdout.write(' ')
+    else:
+        def spin(dev):
+            pass
+
+    deferred = defer.Deferred()
+    collect(dev, source, dest, master_data, deferred, spin)
+
+    return deferred
+
+def pretty_path(path, master_data, unicode=None):
+
+    arrow = ' -> '
+    uarrow = u' → '
+    if unicode:
+        arrow = uarrow
+    elif unicode is None:  # auto
+        try:
+            codecs.lookup(sys.stdout.encoding)[0](uarrow)
+            arrow = uarrow
+        except (TypeError, UnicodeEncodeError):
+            pass
+
+    def name(dev):
+        if master_data[dev]:
+            return "\033[31m%s\033[m:\033[33m%s\033[m:\033[31m%s\033[m" % (master_data[dev]['prev_interface'], dev.shortName, master_data[dev]['next_interface'])
+            return dev.shortName
+        else:
+            return '(%s)' % dev.shortName
+
+    return arrow.join([name(dev) for dev in path])
+
+def find_paths(master_data, dev, prevnext, loop_detect=[]):
+    '''Return all the paths between 'dev' and the destination.'''
+
+    # This could be optimized by caching the partial results.
+    # This is another function in need of test cases.
+
+    if not master_data[dev]:
+        return [[dev]]
+
+    next_dev = dev_for_ip(master_data[dev][prevnext + '_hop'])
+
+    if not next_dev and next_dev == 0 and DEBUG_DNS:
+        try:
+            print "[DEBUG_DNS] %s has route to %s, %s does not resolve to a valid router" % (
+                dev, master_data[dev][prevnext + '_hop'],
+                master_data[dev][prevnext + '_hop'] )
+        except:
+            pass
+
+    if not next_dev: # and master_data[dev][prevnext + '_hop']:
+        return [[dev]]
+    else:
+        looped = next_dev in loop_detect
+        loop_detect = loop_detect + [next_dev]    # don't use .append() or +=
+        if looped:
+            # Exceptions can't take unicode strings in 2.3.  Weak.
+            err = pretty_path(loop_detect, master_data, unicode=False)
+            raise PathLoopError(err)
+        return [[dev] + path for path in find_paths(master_data, next_dev,
+                                                    prevnext, loop_detect)]
+
+def output_path(path, master_data, shortest_paths=[]):
+    '''Print out a human-readable version of the path, as long as it
+    does not end in any of 'shortest_paths'.  Also return ACLs.'''
+
+    # Skip if it just contains a prefix plus the shortest path. This often
+    # happens for traces that travel over the backbone or with a source of
+    # 0.0.0.0; that zone is all default-free so any hop can and will be a
+    # source.
+    for shortest_path in shortest_paths:
+        if (len(path) > len(shortest_path)
+            and path[-len(shortest_path):] == shortest_path):
+            return set()
+
+    print 'Path:', pretty_path(path, master_data)
+    myacls = set()
+    ignored_acls = set()
+    for dev in path:
+        if not master_data[dev]:
+            continue
+
+        for prevnext in ['prev','next']:
+            for inout in ['in', 'out']:
+                interface_acls = master_data[dev][inout + '_acls']
+                interface = master_data[dev][prevnext + '_interface']
+                #acl = interface_acls.get(interface, None)
+                #if acl:
+                acls = interface_acls.get(interface, [])
+                for acl in acls:
+                    # Skip acls we don't want to modify until we come up with a
+                    # better solution to handle filter-lists.
+                    if acl in settings.IGNORED_ACLS:
+                        ignored_acls.add(acl)
+                        continue
+
+                    # Prefix with ' ' or ';'
+                    irrelevant = ' '
+                    if (prevnext == 'prev' and inout == 'out') or (prevnext == 'next' and inout == 'in'):
+                        irrelevant = ';'
+
+                    # Find the canonical name of the ACL.
+                    if dev.vendor in ('cisco', 'foundry'):
+                        if acl.isdigit():
+                            li = [x for x in dev.acls
+                                if x == acl or (x.startswith(acl)
+                                    and not x[len(acl)].isdigit())]
+                            if li:
+                                #assert len(li) == 1
+                                li.sort() # sort so numeric matches are first
+                                acl = li[0]
+                        elif acl.startswith('ACL') and acl[3:].isdigit():
+                            acl = acl[3:] + 'o'
+                        else:
+                            # hack for 115IBS
+                            if acl.startswith('ACL115IBS'): acl = acl[3:]
+                            acl += '.o'
+
+                    # Tag it (normal vs. rogue)
+                    if acl in dev.acls:
+                        rogue = ''
+                        myacls.add(acl)
+                    else:
+                        rogue = 'ROGUE '
+
+                    # Pretty print hops
+                    if ' ' in acl:
+                        acl = '"%s"' % acl
+                    print '%s %sACL %s %sbound on %s %s' % \
+                        (irrelevant, rogue, acl, inout, dev, interface)
+
+    if ignored_acls:
+        print '\nIGNORED ACLs:' 
+        for i in sorted(ignored_acls):
+            print '-', i
+    print ''
+
+    return myacls
+
+def print_master_data(master_data):
+    for dev, data in master_data.iteritems():
+        if not data:
+            continue
+        print "dev %s" % dev
+
+        if data.has_key('prev_interface'):
+            print "\tprevious interface == %s" % data['prev_interface']
+        if data.has_key('next_interface'):
+            print "\tnext interface == %s" % data['next_interface']
+        if data.has_key('prev_hop'):
+            print "\tprev hop is == %s" % data['prev_hop']
+        if data.has_key('next_hop'):
+            print "\tnext hop == %s" % data['next_hop']
+
+        if not data.has_key('subnets'):
+            continue
+
+        for k,v in data['subnets'].iteritems():
+            if len(v)==0:
+                continue
+
+def process_master_data(master_data):
+    '''From a master_data dictionary, print output, and return all the ACLs.
+
+    This function badly needs test cases and refactoring.'''
+
+    # Find all the sources and destinations.
+    sources = set()
+    dests = set()
+    before_source = {}
+    for dev, data in master_data.iteritems():
+        if not data:
+            continue
+
+        for path in find_paths(master_data, dev, 'prev'):
+            if master_data[path[-1]]:
+                sources.add(path[-1])
+            else:
+                # Device is known but has no data (e.g., Netscreen).
+                sources.add(path[-2])
+                before_source[path[-2]] = path[-1]
+
+        if (data['prev_interface'] and not data['prev_hop'] or data['prev_hop'] and not dev_for_ip(data['prev_hop'])):
+            if data['prev_interface']:
+                ni = data['prev_interface']
+                subnets = data['subnets'][ni]
+                subnets.sort()
+                print 'Source interface: %s %s (%s)' % \
+                    (dev,ni,', '.join([str(subnet) for subnet in subnets]))
+                print ''
+
+        if (data['next_interface'] and not data['next_hop'] or data['next_hop'] and not dev_for_ip(data['next_hop'])):
+            if data['next_interface']:
+                dests.add(dev)
+                ni = data['next_interface']
+                subnets = data['subnets'][ni]
+                subnets.sort()
+                print 'Destination interface: %s %s (%s)' % \
+                    (dev, ni, ', '.join([str(subnet) for subnet in subnets]))
+                print ''
+    if not dests:
+        print 'WARNING: Destination interface not determined.'
+        print ''
+
+    # Find all the paths.
+    paths = set()
+    min_path_len = 0
+    for source in sources:
+        for path in find_paths(master_data, source, 'next'):
+            before = before_source.get(source, None)
+            if before:
+                path.insert(0, before)
+            paths.add(tuple(path))
+            if min_path_len is 0 or min_path_len > len(path) > 1:
+                min_path_len = len(path)
+    shortest_paths = [path for path in paths if len(path) == min_path_len]
+
+    # Sanity check to see if the paths seem incomplete.
+    devs_in_paths = set()
+    for path in paths:
+        for dev in path:
+            devs_in_paths.add(dev)
+    for name, devs in (('source', sources), ('destination', dests)):
+        for dev in devs:
+            if dev not in devs_in_paths:
+                print 'WARNING: %s %s not found in path' % (name, dev)
+                print ''
+
+    # Output each path.
+    acls = set()
+    for path in paths:
+        acls |= output_path(path, master_data, shortest_paths)
+
+    return acls
+
+def main(argv):
+    global source_ip
+    global dest_ip
+    source, dest, extra_args = parse_args(argv)
+    source_ip = source
+    dest_ip   = dest
+    if DEBUG is not None:
+        print "Logging to /tmp/fang_debug.log"
+        log.startLogging(open('/tmp/fang_debug.log', 'w'), setStdout=False)
+    print 'Finding path from %s to %s' % (source, dest)
+    print ''
+
+    # Set up a counter so we know when we're done.
+    count = [0]
+    def decrement(x, count=count):
+        count[0] -= 1
+        if not count[0] and reactor.running:
+            reactor.stop()
+
+    # Collect path data.
+    print 'Selecting random starting point...'
+    start_pattern = settings.FIND_ACL_START_PATTERN
+    start = random.choice([dev for dev in NetDevices().itervalues()
+                           if dev.nodeName.startswith(start_pattern)])
+
+    #nd = NetDevices()
+    #start = nd.find('dar2-frr')
+    print 'Starting with:', start
+    log.msg("Random starting point: %s" % start)
+    count[0] += 1
+    d = do_collect(start, source, dest, master_data)
+    d.addErrback(log.err)
+    d.addBoth(decrement)
+
+    # Collect oncall data about the destination via SOAP.
+    try:
+        dest_name = socket.gethostbyaddr(str(dest))[0]
+    except socket.herror:
+        dest_name = None
+    asset_data = []
+    if dest_name:
+        try:
+            # Get asset data here, example:
+            '''
+            asset_dat = AssetOnCall(dest_name)
+            asset_data.append( (
+                asset_dat.team_name,
+                asset_dat.primary_short_name,
+                asset_dat.primary_email,
+                asset_dat.secondary_short_name,
+                asset_dat.secondary_email
+            ) )
+            '''
+        except:
+            pass
+
+    reactor.run()
+
+    # Reactor's done!  We have all the data; now analyze and display it.
+    acls = list(process_master_data(master_data))
+
+    # Use asset data here, example:
+    if asset_data:
+        print 'Asset data for %s:' % dest_name
+        for owner, primname, primail, secname, secmail in asset_data:
+            print '  Owner:', owner
+            print '  Primary: %s <%s>' % (primname, primail)
+            print '  Secondary: %s <%s>' % (secname, secmail)
+        print
+    elif dest_name:
+        print 'Asset data for %s not available.' % dest_name
+        print
+
+    if extra_args:  # checking for full IP access is not so useful
+        for acl in sorted(acls):
+            sys.stdout.write('ACL %s: ' % acl)
+            sys.stdout.flush()
+            acl_path = settings.FIREWALL_DIR + '/acl.' + acl
+            ca_args = ['check_access', '-q', acl_path, str(source), str(dest)] + extra_args
+            exit = os.spawnvp(os.P_WAIT, 'check_access', ca_args)
+            if exit < 0:
+                raise RuntimeError, 'check_access killed with signal %d' % -exit
+            elif exit == 0:
+                print 'open'
+            else:
+                print 'filtered'
+
+if __name__ == '__main__':
+    master_data = {}
+    acls = []
+    main(sys.argv)
