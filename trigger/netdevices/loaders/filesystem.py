@@ -7,7 +7,7 @@ __author__ = 'Jathan McCollum'
 __maintainer__ = 'Jathan McCollum'
 __email__ = 'jathan.mccollum@teamaol.com'
 __copyright__ = 'Copyright 2013, AOL Inc.'
-__version__ = '1.0'
+__version__ = '1.1'
 
 import itertools
 import os
@@ -82,17 +82,19 @@ class RancidLoader(BaseLoader):
     """
     is_usable = True
 
-    def get_data(self, data_source, recurse_subdirs=None):
+    def get_data(self, data_source, recurse_subdirs=None, fields=None):
         data = rancid.parse_rancid_data(data_source,
-                                        recurse_subdirs=recurse_subdirs)
+                                        recurse_subdirs=recurse_subdirs,
+                                        fields=fields)
         return data
 
     def load_data_source(self, data_source, **kwargs):
         # We want to make sure that we've set this variable
         recurse_subdirs = kwargs.get('recurse_subdirs',
                                      settings.RANCID_RECURSE_SUBDIRS)
+        fields = kwargs.get('fields', settings.RANCID_DEVICE_FIELDS)
         try:
-            return self.get_data(data_source, recurse_subdirs)
+            return self.get_data(data_source, recurse_subdirs, fields)
         except Exception as err:
             raise LoaderFailed("Tried %r; and failed: %r" % (data_source, err))
 

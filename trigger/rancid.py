@@ -29,8 +29,8 @@ Or using multiple RANCID instances within a single root::
 __author__ = 'Jathan McCollum'
 __maintainer__ = 'Jathan McCollum'
 __email__ = 'jathan.mccollum@teamaol.com'
-__copyright__ = 'Copyright 2012-2012, AOL Inc.'
-__version__ = '0.1'
+__copyright__ = 'Copyright 2012-2013, AOL Inc.'
+__version__ = '0.2'
 
 import collections
 import copy
@@ -69,7 +69,7 @@ def _parse_delimited_file(root_dir, filename, delimiter=':'):
         (Optional) Field delimiter
     """
     filepath = os.path.join(root_dir, filename)
-    with open(filepath, 'r') as f:
+    with open(filepath, 'rU') as f:
         reader = csv.reader(f, delimiter=delimiter)
         return [r for r in reader if len(r) > 1] # Skip unparsed lines
 
@@ -101,6 +101,16 @@ def parse_rancid_file(rancid_root, filename=RANCID_DB_FILE, fields=None,
     else:
         if not isinstance(fields, collections.Iterable):
             raise RuntimeError('`fields` must be iterable')
+
+        if filename == 'router.db' and 'config' in fields:
+            idx = fields.index('config')
+            for d in device_data:
+                name = d[0]
+                cfg = _parse_config_file(rancid_root, name)
+                if len(d) == 4:
+                    d[idx] = cfg
+                else:
+                    d.append(cfg)
 
     # Map fields to generator of generators (!!)
     metadata = (itertools.izip_longest(fields, vals) for vals in device_data)
@@ -139,7 +149,6 @@ def walk_rancid_subdirs(rancid_root, config_dirname=CONFIG_DIRNAME,
     for root, dirnames, filenames in walker:
         # Skip any path with CVS in it
         if 'CVS' in root:
-            #print 'skipping CVS:', root
             continue
 
         # Don't visit CVS directories
@@ -249,20 +258,21 @@ def gather_devices(subdir_data, rancid_db_file=RANCID_DB_FILE):
     return itertools.chain(*iters)
 
 def _parse_config_file(rancid_root, filename, parser=None,
-                       config_dirname=CONFIG_DIRNAME, max_lines=30):
+                       config_dirname=CONFIG_DIRNAME, max_lines=None):
     """Parse device config file for metadata (make, model, etc.)"""
     filepath = os.path.join(rancid_root, config_dirname, filename)
     try:
         with open(filepath, 'r') as f:
             config = []
             for idx, line in enumerate(f):
-                if idx >= max_lines:
+                if max_lines and idx >= max_lines:
                     break
     
                 if any([line.startswith('#'), line.startswith('!') and len(line) > 2]):
                     config.append(line.strip())
 
-            return config
+            #return config
+            return '\n'.join(config)
 
     except IOError:
         return None
