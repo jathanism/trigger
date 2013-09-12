@@ -294,13 +294,8 @@ class Tacacsrc(object):
         in the filesystem really doesn't buy much.  This is best referred
         to as obfuscation of the .tacacsrc.'''
         with open(keyfile, 'r') as kf:
-            key = kf.readline()
-        if key[-1].isspace():
-            key = key[:-1]
+            key = kf.readline().strip()
         key += self._get_key_nonce_old()
-        key = _perl_pack_Hstar_old((key + (' ' * 48))[:48])
-        assert(len(key) == 24)
-
         return key
 
     def _parse_old(self):
@@ -374,22 +369,14 @@ class Tacacsrc(object):
         print '\nCredentials updated for user: %r, device/realm: %r.' % (user, realm)
 
     def _encrypt_old(self, s):
-        """Encodes using the old method. Adds a newline for you."""
-        cryptobj = DES3.new(self.key, DES3.MODE_ECB)
-        # Crypt::TripleDES pads with *spaces*!  How 1960. Pad it so the
-        # length is a multiple of 8.
-        padding = len(s) % 8 and ' ' * (8 - len(s) % 8) or ''
-
-        # We need to return a newline if a field is empty so as not to break
-        # .tacacsrc parsing (trust me, this is easier)
-        return encodestring(cryptobj.encrypt(s + padding)) or '\n'
+        from SimpleAES import SimpleAES
+        cryptobj = SimpleAES(self.key)
+        return cryptobj.encrypt(s) + '\n'
 
     def _decrypt_old(self, s):
-        """Decodes using the old method. Strips newline for you."""
-        cryptobj = DES3.new(self.key, DES3.MODE_ECB)
-        # rstrip() to undo space-padding; unfortunately this means that
-        # passwords cannot end in spaces.
-        return cryptobj.decrypt(decodestring(s)).rstrip(' ')
+        from SimpleAES import SimpleAES
+        cryptobj = SimpleAES(self.key)
+        return cryptobj.decrypt(s)
 
     def _read_file_old(self):
         """Read old style file and return the raw data."""
