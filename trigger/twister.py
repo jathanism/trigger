@@ -278,7 +278,7 @@ def _choose_execute(device, force_cli=False):
     if device.is_ioslike():
         _execute = execute_ioslike
     elif device.is_netscaler():
-        _execute = execute_netscaler
+        _execute = execute_exec_ssh
     elif device.is_netscreen():
         _execute = execute_netscreen
     elif device.vendor == 'juniper':
@@ -1275,6 +1275,9 @@ class TriggerSSHCommandChannel(TriggerSSHChannelBase):
     def eofReceived(self):
         log.msg('[%s] CHANNEL %s: EOF received.' % (self.device, self.id))
         result = self.data
+
+        # Strip the "Done" prompt from the result (NetScaler only)
+        result = re.sub(settings.NETSCALER_DONE_PROMPT, '', result)
 
         # By default we're checking for IOS-like errors because most vendors
         # fall under this category.

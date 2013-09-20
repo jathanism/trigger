@@ -262,11 +262,14 @@ JUNIPER_FULL_COMMIT_FIELDS = {
 # try to use IOSLIKE_PROMPT_PAT or fallback to DEFAULT_PROMPT_PAT.
 PROMPT_PATTERNS = {
     'aruba': r'\(\S+\)(?: \(\S+\))?\s?#',
-    'citrix': r'\sDone\n$',
     'juniper': r'\S+\@\S+(?:\>|#)\s$',
     'paloalto': r'\r\n\S+(?:\>|#)\s?',
     'netscreen': r'(\w+?:|)[\w().-]*\(?([\w.-])?\)?\s*->\s*$',
 }
+
+# When you execute commands on a NetScaler, " Done\n" always shows at the end
+# of the command output. We can use this pattern to strip it out.
+NETSCALER_DONE_PROMPT = r'\sDone\n'
 
 # When a pattern is not explicitly defined for a vendor, this is what we'll try
 # next (since most vendors are in fact IOS-like)
