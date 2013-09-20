@@ -277,8 +277,6 @@ def _choose_execute(device, force_cli=False):
     """
     if device.is_ioslike():
         _execute = execute_ioslike
-    elif device.is_netscaler():
-        _execute = execute_netscaler
     elif device.is_netscreen():
         _execute = execute_netscreen
     elif device.vendor == 'juniper':
@@ -1120,6 +1118,9 @@ class TriggerSSHChannelBase(channel.SSHChannel, TimeoutMixin, object):
         # Strip the prompt from the match result
         result = self.data[:m.start()]
         result = result[result.find('\n')+1:]
+
+        # Strip the "Done" prompt from the result (NetScaler only)
+        result = re.sub(settings.NETSCALER_DONE_PROMPT, '', result)
 
         # Only keep the results once we've sent any startup_commands
         if self.initialized:
