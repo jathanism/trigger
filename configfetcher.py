@@ -37,7 +37,7 @@ class ConfigFetcher(Commando):
         return self.commands
 
     def to_aruba(self, device, commands=None, extra=None):
-        return ['show config running']
+        return ['show configuration']
 
     def to_netscreen(self, device, commands=None, extra=None):
         return ['get config']
