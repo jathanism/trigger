@@ -14,7 +14,7 @@ __author__ = 'Jathan McCollum, Mark Ellzey Thomas'
 __maintainer__ = 'Jathan McCollum'
 __email__ = 'jmccollum@salesforce.com'
 __copyright__ = 'Copyright 2003-2013, AOL Inc.; 2013 Salesforce.com'
-__version__ = '1.3'
+__version__ = '1.3.1'
 
 from collections import namedtuple
 import csv
@@ -28,13 +28,12 @@ from sqlite3 import dbapi2 as sqlite
 import sys
 from twisted.python import log
 from trigger.cmds import NetACLInfo
-from trigger.netdevices import NetDevices
+from trigger.netdevices import NetDevices, device_match
 
 # Put this here until the default changes to not load ACLs from redis.
 from trigger.conf import settings
 settings.WITH_ACLS = False
 
-#log.startLogging(sys.stdout, setStdout=False)
 
 # Constants
 DEBUG = os.getenv('DEBUG')
@@ -42,9 +41,15 @@ MAX_CONNS = 10
 ROW_LABELS = ('Interface', 'Addresses', 'Subnets', 'ACLs IN', 'ACLs OUT',
               'Description')
 
+# Debug Logging!
+if DEBUG:
+    log.startLogging(sys.stdout, setStdout=False)
+
+
 # Namedtuples
 RowData = namedtuple('RowData', 'all_rows subnet_table')
 DottyData = namedtuple('DottyData', 'graph links')
+
 
 # Functions
 def parse_args(argv):
@@ -83,12 +88,34 @@ default. Works on Cisco, Foundry, Juniper, and NetScreen devices.''')
 
     return opts, args
 
+def get_single_device(devname, production_only=False):
+    """
+    Try to return a single device by name
+
+    :param devname:
+        Device hostname to match
+
+    :param production_only:
+        Whether to include non-production devices
+    """
+    dev = device_match(devname.lower(), production_only=production_only)
+    if dev is None:
+        return []
+    return [dev]
+
 def fetch_router_list(args):
-    """Turns a list of device names into device objects, skipping unsupported,
-    invalid, or filtered devices."""
-    nd = NetDevices(production_only=opts.nonprod)
+    """
+    Return a filtered list of device objects by name.
+
+    :param args:
+        List of device hostnames
+    """
+    prod_only = opts.nonprod
+    if len(args) == 1:
+        return get_single_device(args[0], prod_only)
+
+    nd = NetDevices(production_only=prod_only)
     ret = []
-    blocked_groups = []
     if args:
         for arg in args:
             if not pass_filters(nd.find(arg)):
@@ -97,15 +124,9 @@ def fetch_router_list(args):
 
     else:
         for entry in nd.itervalues():
-            if entry.owningTeam in blocked_groups:
+            if not pass_filters(entry):
                 continue
-            if entry.vendor in ('cisco', 'foundry', 'juniper'):
-                if 'oob' in entry.shortName:
-                    continue
-
-                if not pass_filters(entry):
-                    continue
-                ret.append(entry)
+            ret.append(entry)
 
     return sorted(ret, reverse=True)
 
@@ -271,8 +292,7 @@ def get_interface_data(devices, production_only=True, max_conns=MAX_CONNS):
                        max_conns=max_conns,
                        skip_disabled=skip_disabled)
     ninfo.run()
-    if DEBUG:
-        print 'NetACLInfo done!'
+    log.msg('NetACLInfo done!')
 
     return ninfo.config
 
@@ -307,8 +327,7 @@ def build_output(main_data, opts, labels=None):
             if 'addr' not in iface and not opts.include_disabled:
                 continue
 
-            if DEBUG:
-                print '>>> ', interface
+            log.msg('>>> ', interface)
 
             addrs   = iface['addr']
             subns   = iface['subnets']
@@ -338,9 +357,8 @@ def build_output(main_data, opts, labels=None):
                 else:
                     subnet_table[s] = [(dev, interface, addrs)]
 
-            if DEBUG:
-                print '\t in:', acls_in
-                print '\t ou:', acls_out
+            log.msg('\t in:', acls_in)
+            log.msg('\t ou:', acls_out)
             rows.append([interface, ' '.join(addresses),
              ' '.join(subnets), '\n'.join(acls_in), '\n'.join(acls_out), desctext])
 
