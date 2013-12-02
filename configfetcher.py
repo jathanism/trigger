@@ -6,7 +6,7 @@ from trigger.cmds import Commando
 import xml.etree.cElementTree as ET
 
 class ConfigFetcher(Commando):
-    vendors = ['paloalto', 'juniper', 'aruba', 'netscreen']
+    vendors = ['paloalto', 'juniper', 'aruba', 'netscreen', 'cisco', 'force10']
     config_map = {
         'juniper': 'show configuration',
         'paloalto': 'show config running',
