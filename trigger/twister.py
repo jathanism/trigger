@@ -1015,10 +1015,12 @@ class Interactor(protocol.Protocol):
         """And write data to the terminal."""
         # Check whether we need to send an enable password.
         if not self.enabled and requires_enable(self, data):
+            log.msg('[%s] Interactive PTY requires enable commands' % self.device)
             send_enable(self)
 
-        # Setup and run the initial commands
+        # Setup and run the initial commands, and also assume we're enabled
         if data and not self.initialized:
+            self.enabled = True # Forcefully set enable
             self.factory._init_commands(protocol=self)
             self.initialized = True
 
@@ -1142,7 +1144,7 @@ class TriggerSSHChannelBase(channel.SSHChannel, TimeoutMixin, object):
             if not self.enabled and requires_enable(self, self.data):
                 send_enable(self)
                 return None
-            
+
             # Check for confirmation prompts
             # If the prompt confirms set the index to the matched bytes
             if is_awaiting_confirmation(self.data):
