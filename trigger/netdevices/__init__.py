@@ -163,6 +163,10 @@ def device_match(name, production_only=True):
     return match
 
 
+from crochet import setup, run_in_reactor, wait_for
+setup()
+
+
 # Classes
 class NetDevice(object):
     """
@@ -250,6 +254,32 @@ class NetDevice(object):
 
         # Set the correct line-ending per vendor
         self.delimiter = self._set_delimiter()
+
+        # Sentinel for whether this device has a connection.
+        self.connected = False
+        self.session = None
+
+    def _return_single_result(self, result):
+        return result[0]
+
+    @wait_for(settings.DEFAULT_TIMEOUT)
+    def run_command(self, command):
+        """Run 'show arp' and return the result."""
+        d = self.execute([command])
+        d.addCallback(self._return_single_result)
+        return d
+
+    @wait_for(settings.DEFAULT_TIMEOUT)
+    def execute_loop(self, commands):
+        """Execute commands in a loop."""
+        from trigger import twister
+        d = twister.execute_loop_ssh(self, commands)
+        d.addCallback(self._return_single_result)
+        return d
+
+    def close(self):
+        """Close our session."""
+        self.session.close()
 
     def _populate_data(self, data):
         """
