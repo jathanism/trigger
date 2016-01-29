@@ -251,6 +251,69 @@ class NetDevice(object):
         # Set the correct line-ending per vendor
         self.delimiter = self._set_delimiter()
 
+        self._setup_napalm()
+
+    def _setup_napalm(self):
+        from trigger.napalm_compat import get_driver_for_netdevice
+        try:
+            self._driver = get_driver_for_netdevice(self)
+        # FIXME(jathan): We really need a story around the "support" we have
+        # for devices that don't have NAPALM/Netmiko drivers. And also, no
+        # naked exceptions.
+        except:  # Naked exception
+            self._driver = None
+            return
+
+        from trigger.tacacsrc import Tacacsrc
+        creds = Tacacsrc().creds[settings.DEFAULT_REALM]
+
+        # self._napalm_device = self._driver(self.nodeName, 'jathan', '00bliss!')
+        self._napalm_device = self._driver(
+            self.nodeName, creds.username, creds.password
+        )
+
+    def open(self):
+        """Open a connection to a me."""
+        try:
+            self._napalm_device.open()
+        except:  # Naked except -_-
+            self._napalm_device.device.open()
+
+    def run_command(self, command):
+        """
+        Run a command on the device using NAPALM underlying driver.
+
+        Currently hard-coded to Arista.
+        """
+        mapper = {
+            'arista': self._napalm_device.device.enable,
+            'cisco': self._napalm_device.device.send_command,
+        }
+
+        run = mapper.get(self.vendor.name)
+
+        # return self._napalm_device.device.enable(command)
+        return run(command)
+
+    def get_facts(self):
+        """Return facts from device."""
+        return self._napalm_device.get_facts()
+
+    def get_interfaces(self):
+        """Return interfaces from device."""
+        return self._napalm_device.get_interfaces()
+
+    def get_lldp_neighbors(self):
+        """Return LLDP neighbors from device."""
+        return self._napalm_device.get_lldp_neighbors()
+
+    def close(self):
+        """Close connection to me."""
+        try:
+            self._napalm_device.close()
+        except:  # Naked except -_-
+            self._napalm_device.device.close()
+
     def _populate_data(self, data):
         """
         Populate the custom attribute data
