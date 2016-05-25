@@ -118,6 +118,14 @@ def find_data_loader(loader):
     else:
         raise ImproperlyConfigured('Loader does not define a "load_data" callable data source loader.')
 
+
+from collections import namedtuple
+
+
+#: Holda loader instance and metadata
+LoaderMetadata = namedtuple('LoaderMetadata', 'loader metadata')
+
+
 def load_metadata(data_source, **kwargs):
     """
     Iterate thru data loaders to load metadata.
@@ -154,7 +162,8 @@ def load_metadata(data_source, **kwargs):
             # Successfully parsed (we hope)
             if data is not None:
                 log.msg('LOADERS TRIED: %r' % tried)
-                return data
+                # return data
+                return LoaderMetadata(loader, data)
             else:
                 tried.append(loader)
                 continue

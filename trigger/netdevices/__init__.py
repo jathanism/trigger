@@ -22,12 +22,6 @@ Example::
 
 """
 
-__author__ = 'Jathan McCollum, Eileen Tschetter, Mark Thomas, Michael Shields'
-__maintainer__ = 'Jathan McCollum'
-__email__ = 'jathan@gmail.com'
-__copyright__ = 'Copyright 2006-2013, AOL Inc.; 2013 Salesforce.com'
-__version__ = '2.3.2'
-
 # Imports
 import copy
 import itertools
@@ -73,6 +67,7 @@ def _munge_source_data(data_source=settings.NETDEVICES_SOURCE):
     path = kwargs.pop('path')
     return loader.load_metadata(path, **kwargs)
 
+
 def _populate(netdevices, data_source, production_only, with_acls):
     """
     Populates the NetDevices with NetDevice objects.
@@ -81,7 +76,9 @@ def _populate(netdevices, data_source, production_only, with_acls):
     objects.
     """
     #start = time.time()
-    device_data = _munge_source_data(data_source=data_source)
+    # device_data = _munge_source_data(data_source=data_source)
+    loader, device_data = _munge_source_data(data_source=data_source)
+    netdevices.set_loader(loader)
 
     # Populate AclsDB if `with_acls` is set
     if with_acls:
@@ -93,7 +90,11 @@ def _populate(netdevices, data_source, production_only, with_acls):
 
     # Populate `netdevices` dictionary with `NetDevice` objects!
     for obj in device_data:
-        dev = NetDevice(data=obj, with_acls=aclsdb)
+        # Don't process it if it's already a NetDevice
+        if isinstance(obj, NetDevice):
+            dev = obj
+        else:
+            dev = NetDevice(data=obj, with_acls=aclsdb)
 
         # Only return devices with adminStatus of 'PRODUCTION' unless
         # `production_only` is True
@@ -109,10 +110,11 @@ def _populate(netdevices, data_source, production_only, with_acls):
             continue
 
         # Add to dict
-        netdevices[dev.nodeName] = dev
+        netdevices.add_device(dev)
 
     #end = time.time()
     #print 'Took %f seconds' % (end - start)
+
 
 def device_match(name, production_only=True):
     """
@@ -837,9 +839,17 @@ class NetDevices(DictMixin):
         """
         def __init__(self, production_only, with_acls):
             self._dict = {}
-            _populate(netdevices=self._dict,
+            self.loader = None
+
+            _populate(netdevices=self,
                       data_source=settings.NETDEVICES_SOURCE,
                       production_only=production_only, with_acls=with_acls)
+
+        def set_loader(self, loader):
+            self.loader = loader
+
+        def add_device(self, device):
+            self._dict[device.nodeName] = device
 
         def __getitem__(self, key):
             return self._dict[key]
@@ -864,7 +874,13 @@ class NetDevices(DictMixin):
             :returns: NetDevice object
             """
             key = key.lower()
-            if key in self:
+
+            # Try to use the loader first.
+            if hasattr(self.loader, 'find'):
+                return self.loader.find(key)
+
+            # Or if there's a key, return that.
+            elif key in self:
                 return self[key]
 
             matches = [x for x in self.keys() if x.startswith(key + '.')]
@@ -875,6 +891,9 @@ class NetDevices(DictMixin):
 
         def all(self):
             """Returns all NetDevice objects."""
+            if hasattr(self.loader, 'all') and not self._dict:
+                devices = self.loader.all()
+                [self._dict.setdefault(dev.nodeName, dev) for dev in devices]
             return self.values()
 
         def search(self, token, field='nodeName'):
@@ -931,6 +950,9 @@ class NetDevices(DictMixin):
 
             :returns: List of NetDevice objects
             """
+            if hasattr(self.loader, 'match'):
+                return self.loader.match(**kwargs)
+
             all_field_names = getattr(self, '_all_field_names', {})
 
             # Cache the field names the first time .match() is called.
@@ -966,7 +988,7 @@ class NetDevices(DictMixin):
 
             Known deviceTypes: ['FIREWALL', 'ROUTER', 'SWITCH']
             """
-            return [x for x in self._dict.values() if x.deviceType == devtype]
+            return [x for x in self.values() if x.deviceType == devtype]
 
         def list_switches(self):
             """Returns a list of NetDevice objects with deviceType of SWITCH"""
